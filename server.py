@@ -23,7 +23,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 import os
 import uuid
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -50,6 +50,151 @@ BASE_TMP_DIR = tempfile.mkdtemp(prefix="xlpivot_")
 # ---------------------------------------------------------------------------
 
 
+def now_ist():
+    """India doesn't observe DST, so a fixed UTC+5:30 offset is always
+    correct -- this avoids depending on system/tzdata availability on
+    whatever server this app is deployed to."""
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+
+def match_columns_case_insensitive(df, required_names):
+    """
+    Finds each required column name in df regardless of case/extra spaces
+    (e.g. 'Business unit' vs 'Business Unit'), and returns a mapping of
+    {requested_name: actual_column_name_in_df}. Raises ValueError listing
+    anything genuinely missing.
+    """
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    mapping = {}
+    missing = []
+    for name in required_names:
+        key = name.strip().lower()
+        if key in lookup:
+            mapping[name] = lookup[key]
+        else:
+            missing.append(name)
+    if missing:
+        raise ValueError("Missing expected column(s): " + ", ".join(missing))
+    return mapping
+
+
+def dedupe_headers(headers):
+    """
+    Some source files repeat the exact same header text for more than one
+    column (Excel's PivotTable engine silently renames the 2nd/3rd
+    occurrence to 'Header2'/'Header3' internally for its own field list --
+    the cells themselves still say the same thing). This reproduces that
+    same renaming so repeated columns become individually addressable.
+    """
+    seen = {}
+    result = []
+    for h in headers:
+        key = "" if h is None else str(h).strip()
+        if key == "":
+            result.append(h)
+            continue
+        if key not in seen:
+            seen[key] = 1
+            result.append(key)
+        else:
+            seen[key] += 1
+            result.append(f"{key}{seen[key]}")
+    return result
+
+
+def write_hierarchical_table(ws_out, df, group_levels, all_columns, value_cols,
+                              start_row, blank_line_levels=None,
+                              header_fill_color="BDD7EE",
+                              subtotal_fill_color="DDEBF7",
+                              grand_total_fill_color="FFEB9C"):
+    """
+    Writes df as a detail table with a subtotal row inserted after every
+    group in `group_levels` (outermost first), the same way Excel's
+    PivotTable/Subtotal features nest multiple row fields that each have
+    their own subtotal turned on. Ends with one Grand Total row.
+
+    - all_columns: full ordered list of columns to print per detail row
+      (including the group_levels columns and any extra detail-only columns)
+    - value_cols: the numeric columns to sum for subtotal/grand total rows
+    - blank_line_levels: set of level names that get a blank row inserted
+      right after their subtotal row (mirrors VBA's LayoutBlankLine)
+
+    Returns the next free row after everything has been written.
+    """
+    blank_line_levels = blank_line_levels or set()
+    row = {"i": start_row}
+
+    header_fill = PatternFill(start_color=header_fill_color, end_color=header_fill_color, fill_type="solid")
+    subtotal_fill = PatternFill(start_color=subtotal_fill_color, end_color=subtotal_fill_color, fill_type="solid")
+    grand_fill = PatternFill(start_color=grand_total_fill_color, end_color=grand_total_fill_color, fill_type="solid")
+    thin = Side(style="thin")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Header row
+    for j, label in enumerate(all_columns, start=1):
+        cell = ws_out.cell(row=row["i"], column=j, value=label)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.border = thin_border
+    row["i"] += 1
+
+    def recurse(sub_df, levels):
+        if not levels:
+            for _, rec in sub_df.iterrows():
+                for j, col in enumerate(all_columns, start=1):
+                    ws_out.cell(row=row["i"], column=j, value=rec[col]).border = thin_border
+                row["i"] += 1
+            return {c: float(sub_df[c].sum()) for c in value_cols}
+
+        level = levels[0]
+        level_totals = {c: 0.0 for c in value_cols}
+        for key, group in sub_df.groupby(level, sort=False):
+            sub_totals = recurse(group, levels[1:])
+
+            label_col_idx = all_columns.index(level) + 1
+            for col_idx in range(1, len(all_columns) + 1):
+                cell = ws_out.cell(row=row["i"], column=col_idx)
+                cell.fill = subtotal_fill
+                cell.border = thin_border
+                if col_idx == label_col_idx:
+                    cell.value = f"{key} Total"
+                    cell.font = Font(bold=True)
+            for c in value_cols:
+                col_idx = all_columns.index(c) + 1
+                cell = ws_out.cell(row=row["i"], column=col_idx, value=sub_totals[c])
+                cell.font = Font(bold=True)
+                cell.fill = subtotal_fill
+                cell.border = thin_border
+            row["i"] += 1
+
+            if level in blank_line_levels:
+                row["i"] += 1
+
+            for c in value_cols:
+                level_totals[c] += sub_totals[c]
+        return level_totals
+
+    grand_totals = recurse(df, group_levels)
+
+    grand_row = row["i"]
+    for col_idx in range(1, len(all_columns) + 1):
+        cell = ws_out.cell(row=grand_row, column=col_idx)
+        cell.fill = grand_fill
+        cell.border = thin_border
+        if col_idx == 1:
+            cell.value = "Grand Total"
+            cell.font = Font(bold=True)
+    for c in value_cols:
+        col_idx = all_columns.index(c) + 1
+        cell = ws_out.cell(row=grand_row, column=col_idx, value=grand_totals[c])
+        cell.font = Font(bold=True)
+        cell.fill = grand_fill
+        cell.border = thin_border
+    row["i"] += 1
+
+    return row["i"]
+
+
 def find_header_row_auto(ws, max_scan=20):
     """Equivalent of VBA FindHeaderRow: detects the header row by scanning
     the first few rows for known label text, or the first row where the
@@ -72,7 +217,7 @@ def build_salary_pivot_table(input_path):
     salary_pivot_bu_wise_pdf (PDF output), converted from VBA:
     CreatePivotFromSourceData.
 
-    Returns (detail_df, summary_df, value_cols).
+    Returns (detail_df, summary_df, group_cols, value_cols).
     """
     wb = load_workbook(input_path, data_only=True)
     ws = wb.worksheets[0]
@@ -111,10 +256,10 @@ def build_salary_pivot_table(input_path):
         "Net Salary": "Net Salary",
     }
 
-    missing = [c for c in group_cols if c not in df.columns] + \
-              [c for c in value_cols_map if c not in df.columns]
-    if missing:
-        raise ValueError("Missing expected column(s): " + ", ".join(missing))
+    # Robust match (case/whitespace-insensitive) so small header differences
+    # in the real file don't break this.
+    col_map = match_columns_case_insensitive(df, group_cols + list(value_cols_map.keys()))
+    df = df.rename(columns={actual: wanted for wanted, actual in col_map.items()})
 
     for src_col in value_cols_map:
         df[src_col] = pd.to_numeric(df[src_col], errors="coerce").fillna(0)
@@ -130,7 +275,7 @@ def build_salary_pivot_table(input_path):
         .reset_index()
     )
 
-    return detail_df, summary_df, value_cols
+    return detail_df, summary_df, group_cols, value_cols
 
 
 def salary_pivot_bu_wise(input_path):
@@ -138,47 +283,39 @@ def salary_pivot_bu_wise(input_path):
     Converted from VBA: CreatePivotFromSourceData (CommandButton6, behind
     "1. Salary Pivot BU Wise").
 
-    NOTE: reproduces the SalaryBU > Department > Employee Name > Designation
-    grouping/sort order and the bottom per-SalaryBU summary block from the
-    VBA. It does not reproduce Excel's native collapsible PivotTable
-    subtotals (Excel-only feature) -- instead each SalaryBU group gets one
-    subtotal row + a blank line, matching the visual effect.
+    Reproduces the SalaryBU > Department > Employee Name > Designation
+    grouping/sort order, WITH a subtotal row for both SalaryBU and
+    Department (matching the VBA, which had subtotals turned on for both of
+    those fields), plus the bottom per-SalaryBU summary block. Excel's
+    native collapsible PivotTable grouping UI itself can't be reproduced
+    outside Excel -- this gives the same totals/rows instead.
     """
-    detail_df, summary_df, value_cols = build_salary_pivot_table(input_path)
+    detail_df, summary_df, group_cols, value_cols = build_salary_pivot_table(input_path)
 
     wb = load_workbook(input_path)
-    new_sheet_name = "Pivot_" + datetime.now().strftime("%H%M%S")
+    new_sheet_name = "Pivot_" + now_ist().strftime("%H%M%S")
     ws_out = wb.create_sheet(new_sheet_name)
 
     header_row_out = 10  # matches TableDestination A10 in the VBA
-    col_labels = ["SalaryBU", "Department", "Employee Name", "Designation"] + value_cols
-    for j, label in enumerate(col_labels, start=1):
-        ws_out.cell(row=header_row_out, column=j, value=label).font = Font(bold=True)
+    all_columns = group_cols + value_cols
 
-    row_idx = header_row_out + 1
-    grand_totals = {c: 0.0 for c in value_cols}
+    next_row = write_hierarchical_table(
+        ws_out, detail_df,
+        group_levels=["SalaryBU", "Department"],
+        all_columns=all_columns,
+        value_cols=value_cols,
+        start_row=header_row_out,
+        blank_line_levels={"SalaryBU", "Department"},
+    )
 
-    for bu_val, bu_group in detail_df.groupby("SalaryBU", sort=False):
-        for _, rec in bu_group.iterrows():
-            for j, col in enumerate(["SalaryBU", "Department", "Employee Name", "Designation"] + value_cols, start=1):
-                ws_out.cell(row=row_idx, column=j, value=rec[col])
-            row_idx += 1
-
-        ws_out.cell(row=row_idx, column=1, value=f"{bu_val} Total").font = Font(bold=True)
-        for j, col in enumerate(value_cols, start=5):
-            total_val = float(bu_group[col].sum())
-            ws_out.cell(row=row_idx, column=j, value=total_val).font = Font(bold=True)
-            grand_totals[col] += total_val
-        row_idx += 2  # blank line after subtotal, like LayoutBlankLine=True
-
-    ws_out.cell(row=row_idx, column=1, value="Grand Total").font = Font(bold=True)
-    for j, col in enumerate(value_cols, start=5):
-        ws_out.cell(row=row_idx, column=j, value=grand_totals[col]).font = Font(bold=True)
-    row_idx += 3
+    row_idx = next_row + 2
 
     # Bottom summary block (per SalaryBU: Gross / Deduct / Net) -- mirrors AddBottomSummary
+    header_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
     for j, label in enumerate(["SalaryBU", "Gross Salary", "Deduct Salary", "Net Salary"], start=1):
-        ws_out.cell(row=row_idx, column=j, value=label).font = Font(bold=True)
+        cell = ws_out.cell(row=row_idx, column=j, value=label)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
     row_idx += 1
 
     g_gross = g_deduct = g_net = 0.0
@@ -192,12 +329,13 @@ def salary_pivot_bu_wise(input_path):
         g_net += float(rec["Net Salary"])
         row_idx += 1
 
-    ws_out.cell(row=row_idx, column=1, value="Grand Total").font = Font(bold=True)
-    ws_out.cell(row=row_idx, column=2, value=g_gross).font = Font(bold=True)
-    ws_out.cell(row=row_idx, column=3, value=g_deduct).font = Font(bold=True)
-    ws_out.cell(row=row_idx, column=4, value=g_net).font = Font(bold=True)
+    grand_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    for j, val in enumerate(["Grand Total", g_gross, g_deduct, g_net], start=1):
+        cell = ws_out.cell(row=row_idx, column=j, value=val)
+        cell.font = Font(bold=True)
+        cell.fill = grand_fill
 
-    for col_idx in range(1, len(col_labels) + 1):
+    for col_idx in range(1, len(all_columns) + 1):
         ws_out.column_dimensions[get_column_letter(col_idx)].width = 18
 
     wb.save(input_path)
@@ -209,9 +347,10 @@ def salary_pivot_bu_wise_pdf(input_path):
     Converted from VBA: CommandButton5_Click (exports the pivot to PDF).
     The VBA version exported whichever pivot was created most recently in
     the same session; this web version just rebuilds the same table and
-    exports it straight to PDF.
+    exports it straight to PDF -- including the SalaryBU AND Department
+    subtotal rows (colored so they stand out), matching the Excel version.
     """
-    detail_df, summary_df, value_cols = build_salary_pivot_table(input_path)
+    detail_df, summary_df, group_cols, value_cols = build_salary_pivot_table(input_path)
 
     pdf_path = os.path.splitext(input_path)[0] + "_Salary_Pivot_BU_Wise.pdf"
     doc = SimpleDocTemplate(
@@ -222,21 +361,47 @@ def salary_pivot_bu_wise_pdf(input_path):
     styles = getSampleStyleSheet()
     elements = [Paragraph("Salary Pivot BU Wise", styles["Title"]), Spacer(1, 12)]
 
-    header = ["SalaryBU", "Department", "Employee Name", "Designation"] + value_cols
+    header = group_cols + value_cols
     data = [header]
+    subtotal_rows = []   # track which data rows are subtotal rows, for styling
+    grand_total_row_idx = None
+
+    grand_totals = {c: 0.0 for c in value_cols}
+
     for bu_val, bu_group in detail_df.groupby("SalaryBU", sort=False):
-        for _, rec in bu_group.iterrows():
-            data.append([rec[c] for c in header])
-        totals_row = [f"{bu_val} Total", "", "", ""] + [round(float(bu_group[c].sum()), 2) for c in value_cols]
-        data.append(totals_row)
+        bu_totals = {c: 0.0 for c in value_cols}
+
+        for dept_val, dept_group in bu_group.groupby("Department", sort=False):
+            for _, rec in dept_group.iterrows():
+                data.append([rec[c] for c in header])
+            dept_totals = [float(dept_group[c].sum()) for c in value_cols]
+            data.append([f"{dept_val} Total", "", "", ""] + [round(v, 2) for v in dept_totals])
+            subtotal_rows.append(len(data) - 1)
+            for c, v in zip(value_cols, dept_totals):
+                bu_totals[c] += v
+
+        data.append([f"{bu_val} Total", "", "", ""] + [round(bu_totals[c], 2) for c in value_cols])
+        subtotal_rows.append(len(data) - 1)
+        for c in value_cols:
+            grand_totals[c] += bu_totals[c]
+
+    data.append(["Grand Total", "", "", ""] + [round(grand_totals[c], 2) for c in value_cols])
+    grand_total_row_idx = len(data) - 1
 
     table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([
+    style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#BDD7EE")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("FONTSIZE", (0, 0), (-1, -1), 7),
-    ]))
+    ]
+    for r in subtotal_rows:
+        style_cmds.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor("#DDEBF7")))
+        style_cmds.append(("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"))
+    style_cmds.append(("BACKGROUND", (0, grand_total_row_idx), (-1, grand_total_row_idx), colors.HexColor("#FFEB9C")))
+    style_cmds.append(("FONTNAME", (0, grand_total_row_idx), (-1, grand_total_row_idx), "Helvetica-Bold"))
+
+    table.setStyle(TableStyle(style_cmds))
     elements.append(table)
     doc.build(elements)
     return pdf_path
@@ -382,8 +547,11 @@ def _find_first_rate_column(ws, header_row, last_col):
 def tds_section_wise(input_path):
     """
     Converted from VBA: Cmd_TDS1_Click.
-    Groups by Company > Section Code > Business Unit > Supplier, summing
-    Assessable Amount and Net TDS Amount. Headers are fixed on row 15.
+    Groups by Company > Section Code > Business Unit (each gets its own
+    subtotal row, matching the VBA's default subtotal-on behavior for those
+    3 fields), with Supplier as the detail row and no subtotal (matching
+    the VBA explicitly turning Supplier's subtotal off). Headers fixed on
+    row 15.
     """
     HEADER_ROW = 15
 
@@ -412,36 +580,31 @@ def tds_section_wise(input_path):
 
     group_cols = ["Company", "Section Code", "Business Unit", "Supplier"]
     value_cols = ["Assessable Amount", "Net TDS Amount"]
-    missing = [c for c in group_cols + value_cols if c not in df.columns]
-    if missing:
-        raise ValueError("Missing expected column(s): " + ", ".join(missing))
+
+    # Robust match (case/whitespace-insensitive) -- fixes false "missing
+    # column" errors when the real file's header casing/spacing differs
+    # slightly from what's expected.
+    col_map = match_columns_case_insensitive(df, group_cols + value_cols)
+    df = df.rename(columns={actual: wanted for wanted, actual in col_map.items()})
 
     for c in value_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df = df.sort_values(by=group_cols).reset_index(drop=True)
 
-    new_sheet_name = "Pivot_" + datetime.now().strftime("%H%M%S")
+    new_sheet_name = "Pivot_" + now_ist().strftime("%H%M%S")
     ws_out = wb.create_sheet(new_sheet_name)
 
-    out_cols = group_cols + [f"Sum of {c}" for c in value_cols]
-    for j, label in enumerate(out_cols, start=1):
-        ws_out.cell(row=1, column=j, value=label).font = Font(bold=True)
+    all_columns = group_cols + [f"Sum of {c}" for c in value_cols]
+    df_for_write = df.rename(columns={c: f"Sum of {c}" for c in value_cols})
+    write_hierarchical_table(
+        ws_out, df_for_write,
+        group_levels=["Company", "Section Code", "Business Unit"],
+        all_columns=all_columns,
+        value_cols=[f"Sum of {c}" for c in value_cols],
+        start_row=1,
+    )
 
-    row_idx = 2
-    totals = {c: 0.0 for c in value_cols}
-    for _, rec in df.iterrows():
-        for j, c in enumerate(group_cols, start=1):
-            ws_out.cell(row=row_idx, column=j, value=rec[c])
-        for j, c in enumerate(value_cols, start=len(group_cols) + 1):
-            ws_out.cell(row=row_idx, column=j, value=float(rec[c]))
-            totals[c] += float(rec[c])
-        row_idx += 1
-
-    ws_out.cell(row=row_idx, column=1, value="Grand Total").font = Font(bold=True)
-    for j, c in enumerate(value_cols, start=len(group_cols) + 1):
-        ws_out.cell(row=row_idx, column=j, value=totals[c]).font = Font(bold=True)
-
-    for col_idx in range(1, len(out_cols) + 1):
+    for col_idx in range(1, len(all_columns) + 1):
         ws_out.column_dimensions[get_column_letter(col_idx)].width = 18
 
     wb.save(input_path)
@@ -451,9 +614,11 @@ def tds_section_wise(input_path):
 def tds_pivot_bu_wise(input_path):
     """
     Converted from VBA: Cmd_TDS2_Click.
-    Groups by Business unit > Nature > Supplier > Document Date > (first
-    column literally named "Rate"), summing Assessable Amount and Net TDS
-    Amount. Headers are fixed on row 15.
+    Groups by Business unit > Nature (each gets its own subtotal row,
+    matching the VBA's default subtotal-on behavior for those 2 fields),
+    with Supplier / Document Date / Rate as detail-only columns (matching
+    the VBA explicitly turning their subtotals off). Headers fixed on
+    row 15.
     """
     HEADER_ROW = 15
 
@@ -483,51 +648,56 @@ def tds_pivot_bu_wise(input_path):
     df = pd.DataFrame(rows, columns=headers)
 
     group_cols = ["Business unit", "Nature", "Supplier", "Document Date"]
+    value_cols = ["Assessable Amount", "Net TDS Amount"]
+
+    col_map = match_columns_case_insensitive(df, group_cols + value_cols)
+    df = df.rename(columns={actual: wanted for wanted, actual in col_map.items()})
+
     rate_col_name = None
     if rate_col_idx:
         rate_col_name = headers[rate_col_idx - 1]
         if rate_col_name not in group_cols:
             group_cols = group_cols + [rate_col_name]
 
-    value_cols = ["Assessable Amount", "Net TDS Amount"]
-    missing = [c for c in group_cols + value_cols if c not in df.columns]
-    if missing:
-        raise ValueError("Missing expected column(s): " + ", ".join(missing))
-
     for c in value_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    if "Document Date" in df.columns:
-        df["Document Date"] = pd.to_datetime(df["Document Date"], errors="coerce")
+    df["Document Date"] = pd.to_datetime(df["Document Date"], errors="coerce")
     df = df.sort_values(by=group_cols).reset_index(drop=True)
 
-    new_sheet_name = "Pivot_" + datetime.now().strftime("%H%M%S")
+    new_sheet_name = "Pivot_" + now_ist().strftime("%H%M%S")
     ws_out = wb.create_sheet(new_sheet_name)
 
-    out_cols = group_cols + [f"Sum of {c}" for c in value_cols]
-    for j, label in enumerate(out_cols, start=1):
-        ws_out.cell(row=1, column=j, value=label).font = Font(bold=True)
+    all_columns = group_cols + [f"Sum of {c}" for c in value_cols]
+    df_for_write = df.copy()
+    df_for_write["Document Date"] = df_for_write["Document Date"].apply(
+        lambda v: v.to_pydatetime() if pd.notna(v) else None
+    )
+    df_for_write = df_for_write.rename(columns={c: f"Sum of {c}" for c in value_cols})
 
-    row_idx = 2
-    totals = {c: 0.0 for c in value_cols}
-    for _, rec in df.iterrows():
-        for j, c in enumerate(group_cols, start=1):
-            val = rec[c]
-            cell = ws_out.cell(row=row_idx, column=j, value=val)
-            if c == "Document Date" and pd.notna(val):
-                cell.value = val.to_pydatetime()
-                cell.number_format = "DD/MM/YYYY"
-            if c == rate_col_name:
+    start_row = 1
+    next_row = write_hierarchical_table(
+        ws_out, df_for_write,
+        group_levels=["Business unit", "Nature"],
+        all_columns=all_columns,
+        value_cols=[f"Sum of {c}" for c in value_cols],
+        start_row=start_row,
+    )
+
+    # Apply number formats to the Document Date / Rate detail columns
+    doc_date_col = all_columns.index("Document Date") + 1
+    for r in range(start_row + 1, next_row):
+        cell = ws_out.cell(row=r, column=doc_date_col)
+        if cell.value is not None:
+            cell.number_format = "DD/MM/YYYY"
+
+    if rate_col_name:
+        rate_col_idx_out = all_columns.index(rate_col_name) + 1
+        for r in range(start_row + 1, next_row):
+            cell = ws_out.cell(row=r, column=rate_col_idx_out)
+            if isinstance(cell.value, (int, float)):
                 cell.number_format = "0.00"
-        for j, c in enumerate(value_cols, start=len(group_cols) + 1):
-            ws_out.cell(row=row_idx, column=j, value=float(rec[c]))
-            totals[c] += float(rec[c])
-        row_idx += 1
 
-    ws_out.cell(row=row_idx, column=1, value="Grand Total").font = Font(bold=True)
-    for j, c in enumerate(value_cols, start=len(group_cols) + 1):
-        ws_out.cell(row=row_idx, column=j, value=totals[c]).font = Font(bold=True)
-
-    for col_idx in range(1, len(out_cols) + 1):
+    for col_idx in range(1, len(all_columns) + 1):
         ws_out.column_dimensions[get_column_letter(col_idx)].width = 18
 
     wb.save(input_path)
@@ -576,7 +746,12 @@ def amount_received(input_path):
             break
 
     # --- Read header + data rows into a DataFrame -------------------------------
-    headers = [ws_data.cell(row=header_row, column=c).value for c in range(1, last_col + 1)]
+    raw_headers = [ws_data.cell(row=header_row, column=c).value for c in range(1, last_col + 1)]
+    # Some source files repeat the exact same header text for more than one
+    # column (e.g. "TOTAL REC TILL DATE BASIC" appearing 2-3 times). Excel's
+    # own PivotTable engine auto-renames repeats to "...2", "...3" internally
+    # -- this reproduces that so those columns become individually usable.
+    headers = dedupe_headers(raw_headers)
 
     data_rows = []
     for r in range(header_row + 1, last_row + 1):
@@ -887,7 +1062,7 @@ def creditor_outstanding(input_path):
     dest_ws = add_next_available_sheet(wb, "SourceData")
 
     # --- timestamp -----------------------------------------------------------------
-    dest_ws.cell(row=1, column=2, value="Report Generated: " + datetime.now().strftime("%d-%b-%Y %I:%M:%S %p"))
+    dest_ws.cell(row=1, column=2, value="Report Generated: " + now_ist().strftime("%d-%b-%Y %I:%M:%S %p"))
     dest_ws.cell(row=1, column=2).font = Font(bold=True, italic=True)
 
     section_start_row = 3  # leave row 2 blank, same as the VBA
@@ -1063,49 +1238,65 @@ def serve_dashboard():
 
 @app.route("/api/run-report", methods=["POST"])
 def run_report():
-    report_id = request.form.get("report_id")
-    uploaded_file = request.files.get("file")
-    uploaded_file2 = request.files.get("file2")
-
-    if not report_id or report_id not in REPORT_HANDLERS:
-        return jsonify({"message": f"Unknown report_id: {report_id}"}), 400
-
-    if not uploaded_file:
-        return jsonify({"message": "No file was uploaded."}), 400
-
-    if report_id in TWO_FILE_REPORTS and not uploaded_file2:
-        return jsonify({"message": "This report needs a second file."}), 400
-
-    # Each request gets its own private folder, so two people uploading a
-    # file with the same name at the same time never collide or overwrite
-    # each other's data.
-    request_dir = os.path.join(BASE_TMP_DIR, uuid.uuid4().hex)
-    os.makedirs(request_dir, exist_ok=True)
-
-    input_path = os.path.join(request_dir, uploaded_file.filename)
-    uploaded_file.save(input_path)
-
-    input_path2 = None
-    if uploaded_file2:
-        input_path2 = os.path.join(request_dir, uploaded_file2.filename)
-        uploaded_file2.save(input_path2)
-
-    handler = REPORT_HANDLERS[report_id]
-
     try:
+        report_id = request.form.get("report_id")
+        uploaded_file = request.files.get("file")
+        uploaded_file2 = request.files.get("file2")
+
+        if not report_id or report_id not in REPORT_HANDLERS:
+            return jsonify({"message": f"Unknown report_id: {report_id}"}), 400
+
+        if not uploaded_file:
+            return jsonify({"message": "No file was uploaded."}), 400
+
+        if report_id in TWO_FILE_REPORTS and not uploaded_file2:
+            return jsonify({"message": "This report needs a second file."}), 400
+
+        # Each request gets its own private folder, and File 1 / File 2 each
+        # get their OWN subfolder within it -- so even if both files happen
+        # to share the exact same filename (e.g. both named "Report.xlsx"),
+        # they can never overwrite each other.
+        request_dir = os.path.join(BASE_TMP_DIR, uuid.uuid4().hex)
+        file1_dir = os.path.join(request_dir, "file1")
+        os.makedirs(file1_dir, exist_ok=True)
+
+        input_path = os.path.join(file1_dir, uploaded_file.filename)
+        uploaded_file.save(input_path)
+
+        input_path2 = None
+        if uploaded_file2:
+            file2_dir = os.path.join(request_dir, "file2")
+            os.makedirs(file2_dir, exist_ok=True)
+            input_path2 = os.path.join(file2_dir, uploaded_file2.filename)
+            uploaded_file2.save(input_path2)
+
+        handler = REPORT_HANDLERS[report_id]
+
         if report_id in TWO_FILE_REPORTS:
             result = handler(input_path, input_path2)
         else:
             result = handler(input_path)
+
+        # If the handler returned a file path, send that file back for download.
+        if isinstance(result, str) and os.path.isfile(result):
+            return send_file(result, as_attachment=True)
+
+        # Otherwise treat it as a JSON status message.
+        return jsonify(result)
+
     except Exception as exc:
-        return jsonify({"message": f"Error while running {report_id}: {exc}"}), 500
+        # Catches EVERY failure point in this route (file saving, report
+        # logic, anything) so the browser always gets a clear JSON error
+        # message instead of a raw "Internal Server Error" page.
+        return jsonify({"message": f"Error while running the report: {exc}"}), 500
 
-    # If the handler returned a file path, send that file back for download.
-    if isinstance(result, str) and os.path.isfile(result):
-        return send_file(result, as_attachment=True)
 
-    # Otherwise treat it as a JSON status message.
-    return jsonify(result)
+@app.errorhandler(Exception)
+def handle_any_uncaught_error(exc):
+    """Final safety net: if anything anywhere in the app raises an
+    exception that wasn't already caught, return clean JSON instead of
+    Flask's default HTML error page."""
+    return jsonify({"message": f"Unexpected server error: {exc}"}), 500
 
 
 if __name__ == "__main__":
