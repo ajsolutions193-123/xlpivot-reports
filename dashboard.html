@@ -126,7 +126,7 @@
   <div class="form-window">
 
     <div class="header-row">
-      <div class="header-title">Welcome to Excel to XLPivot &amp; Reporting System</div>
+      <div class="header-title">Welcom to Excel to XLPivot &amp; Reporting System</div>
       <div class="anil-badge" id="userBadge">ANIL</div>
     </div>
 
@@ -140,6 +140,7 @@
         <input type="text" id="filePathDisplay" readonly>
       </div>
       <input type="file" id="fileInput" class="file-picker-hidden" accept=".xlsx,.xls,.csv" onchange="handleFileSelect(event)">
+      <input type="file" id="file2Input" class="file-picker-hidden" accept=".xlsx,.xls,.csv">
     </div>
 
     <div class="status-bar info" id="statusBar"></div>
@@ -211,10 +212,41 @@
       bar.className = 'status-bar ' + kind;
     }
 
+    // Reports that need TWO files (like your VBA macros that pick File 1
+    // then File 2 and compare them).
+    const TWO_FILE_REPORTS = new Set([
+      'gross_salary_comparision',
+      'net_salary_comparision',
+      'daybook_difference'
+    ]);
+
+    function pickSecondFile() {
+      return new Promise((resolve) => {
+        const input = document.getElementById('file2Input');
+        input.value = ''; // reset so re-picking the same file still fires 'change'
+        const handler = (e) => {
+          input.removeEventListener('change', handler);
+          resolve(e.target.files[0] || null);
+        };
+        input.addEventListener('change', handler);
+        input.click();
+      });
+    }
+
     async function runReport(reportId, buttonEl) {
       if (!selectedFile) {
         setStatus('Please pick a source file first.', 'error');
         return;
+      }
+
+      let secondFile = null;
+      if (TWO_FILE_REPORTS.has(reportId)) {
+        setStatus('This report compares two files. Please choose the SECOND file now...', 'working');
+        secondFile = await pickSecondFile();
+        if (!secondFile) {
+          setStatus('No second file selected. Report cancelled.', 'error');
+          return;
+        }
       }
 
       const allButtons = document.querySelectorAll('.report-btn');
@@ -225,6 +257,9 @@
         const formData = new FormData();
         formData.append('file', selectedFile);
         formData.append('report_id', reportId);
+        if (secondFile) {
+          formData.append('file2', secondFile);
+        }
 
         const response = await fetch(API_BASE + '/api/run-report', {
           method: 'POST',
